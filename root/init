@@ -1,0 +1,43 @@
+#!/bin/sh
+set -eu
+
+PUID=${PUID:-70}
+PGID=${PGID:-70}
+UMASK=${UMASK:-022}
+TZ=${TZ:-Asia/Shanghai}
+
+case "$PUID" in
+	''|*[!0-9]*) echo "PUID must be a numeric user ID" >&2; exit 1 ;;
+esac
+case "$PGID" in
+	''|*[!0-9]*) echo "PGID must be a numeric group ID" >&2; exit 1 ;;
+esac
+case "$UMASK" in
+	''|*[!0-7]*|????*) echo "UMASK must be an octal value from 000 to 777" >&2; exit 1 ;;
+esac
+case "$TZ" in
+	/*|*..*) echo "TZ must be a valid timezone name" >&2; exit 1 ;;
+esac
+
+umask "$UMASK"
+
+if [ ! -e "/usr/share/zoneinfo/$TZ" ]; then
+	echo "Unknown timezone: $TZ" >&2
+	exit 1
+fi
+export TZ
+
+if [ "$(id -u)" -eq 0 ]; then
+	if ! getent group "$PGID" >/dev/null; then
+		groupmod -g "$PGID" postgres
+	fi
+	target_group=$(getent group "$PGID" | cut -d: -f1)
+	usermod -u "$PUID" -g "$target_group" postgres
+	ln -snf "/usr/share/zoneinfo/$TZ" /etc/localtime
+	printf '%s\n' "$TZ" > /etc/timezone
+elif [ "$(id -u)" != "$PUID" ] || [ "$(id -g)" != "$PGID" ]; then
+	echo "When running without root, container UID/GID must match PUID/PGID" >&2
+	exit 1
+fi
+
+exec /usr/local/bin/docker-entrypoint.sh "$@"

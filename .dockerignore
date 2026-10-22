@@ -1,0 +1,6 @@
+# keep the build context minimal
+.git
+.github
+README.md
+*.md
+templates

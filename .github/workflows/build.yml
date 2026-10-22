@@ -1,0 +1,234 @@
+name: Build and publish PostgreSQL image
+
+on:
+  schedule:
+    - cron: "23 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      pg_version:
+        description: PostgreSQL release to build (for example 18.1); blank uses the latest stable release
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  resolve-version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      major: ${{ steps.version.outputs.major }}
+      latest: ${{ steps.version.outputs.latest }}
+      series_latest: ${{ steps.version.outputs.series_latest }}
+    steps:
+      - name: Resolve PostgreSQL release
+        id: version
+        shell: bash
+        env:
+          REQUESTED_PG_VERSION: ${{ inputs.pg_version }}
+        run: |
+          set -euo pipefail
+          versions="$(curl -fsSL https://www.postgresql.org/versions.json)"
+          latest_version="$(jq -r '[.[] | select(.current == true) | "\(.major).\(.latestMinor)"] | first' <<< "$versions")"
+          pg_version="${REQUESTED_PG_VERSION:-$latest_version}"
+          [[ "$pg_version" =~ ^[0-9]+\.[0-9]+$ ]] || {
+            echo "Invalid PostgreSQL release: $pg_version" >&2
+            exit 1
+          }
+          major="${pg_version%%.*}"
+          series_latest="$(jq -r --arg major "$major" \
+            '[.[] | select((.major | tostring) == $major) | "\(.major).\(.latestMinor)"][0] // empty' \
+            <<< "$versions")"
+          [[ -n "$series_latest" ]] || {
+            echo "PostgreSQL major version $major was not found in versions.json" >&2
+            exit 1
+          }
+
+          echo "version=$pg_version" >> "$GITHUB_OUTPUT"
+          echo "major=$major" >> "$GITHUB_OUTPUT"
+          if [[ "$pg_version" == "$latest_version" ]]; then
+            echo "latest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "latest=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [[ "$pg_version" == "$series_latest" ]]; then
+            echo "series_latest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "series_latest=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-and-smoke-test:
+    needs: resolve-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+            platform: linux/amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            platform: linux/arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push architecture image
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          build-args: |
+            PG_VERSION=${{ needs.resolve-version.outputs.version }}
+            PG_MAJOR=${{ needs.resolve-version.outputs.major }}
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+          provenance: false
+          sbom: false
+
+      - name: Pull architecture image for smoke test
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          image="${IMAGE}@${DIGEST}"
+          docker pull "$image"
+          docker tag "$image" pg-test:ci
+
+      - name: Prepare initialization SQL
+        run: |
+          mkdir -p "$RUNNER_TEMP/pg-init"
+          cat > "$RUNNER_TEMP/pg-init/001-smoke.sql" <<'SQL'
+          CREATE TABLE workflow_smoke (id integer);
+          INSERT INTO workflow_smoke VALUES (1);
+          SQL
+
+      - name: Start PostgreSQL
+        run: |
+          docker run -d --name pg-ci \
+            -e POSTGRES_USER=ci \
+            -e POSTGRES_PASSWORD=ci \
+            -e POSTGRES_DB=ci \
+            -e POSTGRES_INITDB_ARGS='--locale-provider=icu --icu-locale=zh' \
+            -v "$RUNNER_TEMP/pg-init:/docker-entrypoint-initdb.d:ro" \
+            pg-test:ci
+
+      - name: Wait for PostgreSQL and check en/zh ICU
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 90); do
+            status="$(docker inspect --format '{{.State.Health.Status}}' pg-ci)"
+            if [[ "$status" == healthy ]]; then
+              break
+            fi
+            if [[ "$status" == unhealthy ]]; then
+              docker logs pg-ci
+              exit 1
+            fi
+            if [[ "$attempt" == 90 ]]; then
+              docker logs pg-ci
+              echo "PostgreSQL did not become healthy" >&2
+              exit 1
+            fi
+            sleep 2
+          done
+          result="$(docker exec -i pg-ci psql -U ci -d ci -v ON_ERROR_STOP=1 -At <<'SQL'
+          SELECT ('a' COLLATE "en-x-icu") < 'b',
+                 ('阿' COLLATE "zh-x-icu") < '波',
+                 (SELECT count(*) = 1 FROM workflow_smoke);
+          SQL
+          )"
+          [[ "$result" == 't|t|t' ]] || {
+            echo "Unexpected smoke-test result: $result" >&2
+            exit 1
+          }
+
+      - name: Save image digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          printf '%s' "$DIGEST" > "$RUNNER_TEMP/digests/$ARCH"
+
+      - name: Upload image digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Show container logs on failure
+        if: failure()
+        run: docker logs pg-ci || true
+
+      - name: Remove test container
+        if: always()
+        run: docker rm -f pg-ci || true
+
+  publish-manifest:
+    needs: [resolve-version, build-and-smoke-test]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download architecture digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digests-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish multi-architecture tags
+        env:
+          PG_VERSION: ${{ needs.resolve-version.outputs.version }}
+          PG_MAJOR: ${{ needs.resolve-version.outputs.major }}
+          IS_LATEST: ${{ needs.resolve-version.outputs.latest }}
+          IS_SERIES_LATEST: ${{ needs.resolve-version.outputs.series_latest }}
+        run: |
+          set -euo pipefail
+          image_refs=()
+          for arch in amd64 arm64; do
+            digest_file="$RUNNER_TEMP/digests/$arch"
+            [[ -s "$digest_file" ]] || {
+              echo "Missing $arch image digest" >&2
+              exit 1
+            }
+            image_refs+=("${IMAGE}@$(cat "$digest_file")")
+          done
+
+          tags=(--tag "${IMAGE}:${PG_VERSION}")
+          if [[ "$IS_SERIES_LATEST" == true ]]; then
+            tags+=(--tag "${IMAGE}:${PG_MAJOR}")
+          fi
+          if [[ "$IS_LATEST" == true ]]; then
+            tags+=(--tag "${IMAGE}:latest")
+          fi
+
+          docker buildx imagetools create "${tags[@]}" "${image_refs[@]}"
