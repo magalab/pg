@@ -5,12 +5,18 @@ binary=$1
 out_dir=$2
 mkdir -p "$out_dir"
 
-if ! ldd_output=$(ldd "$binary" 2>&1); then
+ldd_status=0
+ldd_output=$(ldd "$binary" 2>&1) || ldd_status=$?
+
+# PostgreSQL plugins can reference symbols exported by the postgres process.
+# musl's ldd reports those expected unresolved-at-load-time symbols as an
+# error, even though it still lists any shared libraries the plugin needs.
+if [ "$ldd_status" -ne 0 ] && ! printf '%s\n' "$ldd_output" | grep -q '^Error relocating .*: .*: symbol not found$'; then
 	printf 'Unable to inspect shared libraries for %s:\n%s\n' "$binary" "$ldd_output" >&2
 	exit 1
 fi
 
-missing=$(printf '%s\n' "$ldd_output" | awk '/not found/ { print $1 }')
+missing=$(printf '%s\n' "$ldd_output" | awk '/=> not found/ || /Error loading shared library .*No such file or directory/ { print }')
 if [ -n "$missing" ]; then
 	printf 'Missing shared libraries for %s:\n%s\n' "$binary" "$missing" >&2
 	exit 1
