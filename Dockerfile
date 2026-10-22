@@ -83,8 +83,8 @@ RUN --mount=type=cache,target=/var/cache/apk \
         --with-openssl \
         --with-zstd \
     ; \
-    make -j "$(nproc)" world-bin; \
-    make install-world-bin; \
+    make -j "$(nproc)" all; \
+    make install; \
     # sanity check before build deps are removed
     postgres --version; \
     \
@@ -93,8 +93,9 @@ RUN --mount=type=cache,target=/var/cache/apk \
     \
     # collect every runtime shared library (jellyfin style) BEFORE build deps are removed
     for bin in /usr/local/bin/* /usr/local/lib/postgresql/*.so; do \
-        if [ -e "$bin" ]; then cplibfiles.sh "$bin" /out; fi; \
+        if [ -e "$bin" ] && [ "$bin" != /usr/local/bin/cplibfiles.sh ]; then cplibfiles.sh "$bin" /out; fi; \
     done; \
+    rm -f /usr/local/bin/cplibfiles.sh; \
     \
     # remove build deps and leftover residue
     apk del --no-network .build-deps; \
