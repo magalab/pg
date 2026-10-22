@@ -53,6 +53,7 @@ RUN --mount=type=cache,target=/var/cache/apk \
         make \
         openssl-dev \
         perl \
+        readline-dev \
         util-linux-dev \
         zlib-dev \
         icu-dev \
